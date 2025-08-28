@@ -249,6 +249,12 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--val_dataset",
+        type=str,
+        default=None,
+        help="Dataset name or path for the validation set.",
+    )
+    parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing an image."
     )
     parser.add_argument(
@@ -754,6 +760,18 @@ def main():
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
+    val_dataset = None
+    if args.val_dataset is not None:
+        if os.path.isdir(args.val_dataset):
+            val_files = {"validation": os.path.join(args.val_dataset, "**")}
+            val_dataset = load_dataset("imagefolder", data_files=val_files, cache_dir=args.cache_dir)
+        else:
+            val_dataset = load_dataset(
+                args.val_dataset,
+                args.dataset_config_name,
+                cache_dir=args.cache_dir,
+            )
+
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
     column_names = dataset["train"].column_names
@@ -814,10 +832,25 @@ def main():
         ]
     )
 
+    val_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=interpolation),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
+        return examples
+
+    def preprocess_val(examples):
+        images = [image.convert("RGB") for image in examples[image_column]]
+        examples["pixel_values"] = [val_transforms(image) for image in images]
+        examples["input_ids"] = tokenize_captions(examples, is_train=False)
         return examples
 
     with accelerator.main_process_first():
@@ -825,6 +858,9 @@ def main():
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
+        if val_dataset is not None:
+            val_split = "validation" if "validation" in val_dataset else list(val_dataset.keys())[0]
+            val_dataset = val_dataset[val_split].with_transform(preprocess_val)
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -840,6 +876,16 @@ def main():
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
+
+    val_dataloader = None
+    if val_dataset is not None:
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            shuffle=False,
+            collate_fn=collate_fn,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
 
     # Scheduler and math around the number of training steps.
     # Check the PR https://github.com/huggingface/diffusers/pull/8312 for detailed explanation.
@@ -861,9 +907,14 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
-    )
+    if val_dataloader is not None:
+        unet, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, train_dataloader, val_dataloader, lr_scheduler
+        )
+    else:
+        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler
+        )
 
     if args.use_ema:
         if args.offload_ema:
@@ -922,6 +973,7 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
+    best_val_loss = float("inf")
     first_epoch = 0
 
     # Potentially load in the weights and states from a previous save
@@ -1094,6 +1146,47 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
+        if val_dataloader is not None and args.use_ema:
+            unet.eval()
+            val_losses = []
+            for val_batch in val_dataloader:
+                with torch.no_grad():
+                    latents = vae.encode(val_batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+                    latents = latents * vae.config.scaling_factor
+                    noise = torch.randn_like(latents)
+                    if args.noise_offset:
+                        noise += args.noise_offset * torch.randn(
+                            (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                        )
+                    if args.input_perturbation:
+                        new_noise = noise + args.input_perturbation * torch.randn_like(noise)
+                    bsz = latents.shape[0]
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                    ).long()
+                    if args.input_perturbation:
+                        noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
+                    else:
+                        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    encoder_hidden_states = text_encoder(val_batch["input_ids"], return_dict=False)[0]
+                    student_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                    if args.offload_ema:
+                        ema_unet.to(device="cuda", non_blocking=True)
+                    ema_unet.store(unet.parameters())
+                    ema_unet.copy_to(unet.parameters())
+                    teacher_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                    ema_unet.restore(unet.parameters())
+                    if args.offload_ema:
+                        ema_unet.to(device="cpu", non_blocking=True)
+                    loss = F.mse_loss(student_pred.float(), teacher_pred.float(), reduction="mean")
+                val_losses.append(accelerator.gather(loss.detach().unsqueeze(0)))
+            val_loss = torch.mean(torch.cat(val_losses)).item()
+            accelerator.log({"val_loss": val_loss}, step=global_step)
+            accelerator.print(f"Epoch {epoch}: validation loss {val_loss}")
+            if accelerator.is_main_process and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(unwrap_model(unet).state_dict(), os.path.join(args.output_dir, "student_unet_best.pt"))
+            unet.train()
 
         if accelerator.is_main_process:
             if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
