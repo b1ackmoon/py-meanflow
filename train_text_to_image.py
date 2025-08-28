@@ -41,6 +41,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
+from PIL import Image
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
@@ -195,6 +196,63 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
     torch.cuda.empty_cache()
 
     return images
+
+
+def save_epoch_sample(
+    vae,
+    text_encoder,
+    tokenizer,
+    unet,
+    args,
+    accelerator,
+    weight_dtype,
+    epoch,
+    sample_latents,
+    sample_prompt,
+):
+    """Generate and store a sample image for the given epoch."""
+
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=accelerator.unwrap_model(vae),
+        text_encoder=accelerator.unwrap_model(text_encoder),
+        tokenizer=tokenizer,
+        unet=accelerator.unwrap_model(unet),
+        safety_checker=None,
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    latents = sample_latents.clone().to(accelerator.device, dtype=weight_dtype)
+    with torch.autocast(accelerator.device.type):
+        output = pipeline(
+            sample_prompt,
+            num_inference_steps=20,
+            latents=latents,
+            output_type="latent",
+        )
+    latents = output.images
+
+    with torch.no_grad():
+        image = vae.decode(latents / vae.config.scaling_factor).sample
+
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image[0].detach().cpu().permute(1, 2, 0).numpy()
+    image = (image * 255).round().astype("uint8")
+    image = Image.fromarray(image)
+
+    sample_dir = os.path.join(args.output_dir, "samples")
+    os.makedirs(sample_dir, exist_ok=True)
+    image.save(os.path.join(sample_dir, f"epoch_{epoch}.png"))
+
+    del pipeline
+    torch.cuda.empty_cache()
 
 
 def parse_args():
@@ -959,6 +1017,15 @@ def main():
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
+    sample_prompt = (
+        args.validation_prompts[0] if args.validation_prompts else "a photo of an astronaut riding a horse"
+    )
+    sample_latents = torch.randn(
+        (1, unet.config.in_channels, args.resolution // 8, args.resolution // 8),
+        generator=torch.Generator(device=accelerator.device).manual_seed(args.seed or 0),
+        device=accelerator.device,
+        dtype=weight_dtype,
+    )
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
@@ -1096,11 +1163,11 @@ def main():
                 break
 
         if accelerator.is_main_process:
+            if args.use_ema:
+                ema_unet.store(unet.parameters())
+                ema_unet.copy_to(unet.parameters())
+
             if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
-                if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema_unet.store(unet.parameters())
-                    ema_unet.copy_to(unet.parameters())
                 log_validation(
                     vae,
                     text_encoder,
@@ -1111,9 +1178,22 @@ def main():
                     weight_dtype,
                     global_step,
                 )
-                if args.use_ema:
-                    # Switch back to the original UNet parameters.
-                    ema_unet.restore(unet.parameters())
+
+            save_epoch_sample(
+                vae,
+                text_encoder,
+                tokenizer,
+                unet,
+                args,
+                accelerator,
+                weight_dtype,
+                epoch,
+                sample_latents,
+                sample_prompt,
+            )
+
+            if args.use_ema:
+                ema_unet.restore(unet.parameters())
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
